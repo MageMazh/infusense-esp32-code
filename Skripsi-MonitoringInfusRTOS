@@ -1,0 +1,659 @@
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include "HX711.h"
+#include <Firebase_ESP_Client.h>
+#include <Preferences.h>
+#include <vector>
+
+#define API_KEY "AIzaSyC-swo_AKNeHXA27AuNMh0zi1oUamp6MGE"
+#define DATABASE_URL "https://infusense-default-rtdb.firebaseio.com/"
+
+// HX711 (load cell)
+#define DT 18
+#define SCK 19
+HX711 scale;
+float calibration_factor = 1032.00;
+
+// Firebase
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+FirebaseJson json;
+
+// IR sensor
+const int IR_SENSOR_PIN = 13;
+
+// WifiManager
+WiFiManager wm;
+const char *apName = "INFUS-ROOM-001-BED-01";
+const char *apPassword = "testing123";
+
+struct WiFiCredential {
+  String ssid;
+  String password;
+};
+
+#define MAX_WIFI_SAVED 5            // maksimal simpan 5 jaringan WiFi
+#define WIFI_CONNECT_TIMEOUT 15000  // timeout koneksi 15 detik
+Preferences preferences;
+
+volatile unsigned int tetesDalamMenit = 0;
+volatile unsigned long lastIRMillis = 0;
+volatile unsigned long lastDripMillis = 0;
+const unsigned long debounceDelay = 150;
+
+volatile bool infusionAttached = false;
+bool initialStartSent = false;
+int lastKnownStableWeight = 0;
+const unsigned long tpmInterval = 60000;
+unsigned long lastTPMSend = 0;
+int latestTPM = 0;
+
+// path firebase
+String firebasePatientPath = "/patients/room-001-bed-01";
+
+volatile bool dripDetectedFlag = false;
+volatile float dripInterval_ISR_float = 0.0;
+volatile bool dripEventReady = false;
+
+// handle task
+TaskHandle_t TaskWiFiMonitorHandle;
+TaskHandle_t TaskInfusionMonitorHandle;
+TaskHandle_t TaskDropHandle;
+TaskHandle_t TaskFirebaseHandle;
+TaskHandle_t TaskPeriodicHandle;
+
+// flag firebase
+volatile bool periodicResetRequest = false;
+bool newDataUpdate = false;
+
+// wifi disconnect
+volatile bool portalRunning = false;
+bool tasksDisconnectSuspended = false;
+bool tasksSuspended = false;
+unsigned long lastSavedWiFiAttempt = 0;
+const unsigned long SAVED_WIFI_RETRY_MS = 15000; // coba auto-reconnect tiap 15 detik
+bool isReconnectPeriodic = false;
+bool isReconnectDrip = false;
+
+void IRAM_ATTR detectTetesan() {
+  // Jika task drop belum dibuat, jangan apa-apa
+  if (TaskDropHandle == nullptr) return;
+
+  unsigned long now = millis();
+  unsigned long currentDripInterval_ms;
+
+
+  if ((now - lastIRMillis > debounceDelay) && infusionAttached) {
+    if (now - lastDripMillis == 0) {
+      return;
+    }
+
+    tetesDalamMenit++;
+    currentDripInterval_ms = now - lastDripMillis;
+    lastDripMillis = now;
+
+    noInterrupts();
+    dripInterval_ISR_float = currentDripInterval_ms / 1000.0;
+    interrupts();
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    vTaskNotifyGiveFromISR(TaskDropHandle, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+
+    lastIRMillis = now;
+  }
+}
+
+void sendInitialDataToFirebase(int initialBerat) {
+  json.add("status", "initializing");
+  json.add("volume", initialBerat);
+  json.add("interval", 0);
+  json.add("drip_rate_tpm", 0);
+
+  if (Firebase.RTDB.updateNode(&fbdo, firebasePatientPath, &json)) {
+    Serial.println("Data awal terkirim ke Firebase");
+  } else {
+    Serial.print("Gagal mengirim: " + fbdo.errorReason());
+  }
+}
+
+std::vector<WiFiCredential> loadSavedWiFi() {
+  preferences.begin("wifiCreds", true);
+  int count = preferences.getInt("count", 0);
+  std::vector<WiFiCredential> list;
+
+  for (int i = 0; i < count; i++) {
+    WiFiCredential cred;
+    cred.ssid = preferences.getString(("ssid" + String(i)).c_str(), "");
+    cred.password = preferences.getString(("pass" + String(i)).c_str(), "");
+    if (cred.ssid.length() > 0)
+      list.push_back(cred);
+  }
+
+  preferences.end();
+  return list;
+}
+
+// simpan SSID + password ke NVS
+void saveWiFiCredential(const String &ssid, const String &password) {
+  preferences.begin("wifiCreds", false);
+  int count = preferences.getInt("count", 0);
+  bool exists = false;
+
+  // Cek apakah sudah pernah ada
+  for (int i = 0; i < count; i++) {
+    String savedSSID = preferences.getString(("ssid" + String(i)).c_str(), "");
+    if (savedSSID == ssid) {
+      exists = true;
+      break;
+    }
+  }
+
+  if (!exists) {
+    // Geser data lama
+    if (count >= MAX_WIFI_SAVED) {
+      count = MAX_WIFI_SAVED - 1;
+    }
+
+    // Geser semua ke bawah 1 slot (hapus yang paling lama)
+    for (int i = count; i > 0; i--) {
+      preferences.putString(("ssid" + String(i)).c_str(), preferences.getString(("ssid" + String(i - 1)).c_str(), ""));
+      preferences.putString(("pass" + String(i)).c_str(), preferences.getString(("pass" + String(i - 1)).c_str(), ""));
+    }
+
+    // Tulis baru di indeks 0
+    preferences.putString("ssid0", ssid);
+    preferences.putString("pass0", password);
+    preferences.putInt("count", count + 1 > MAX_WIFI_SAVED ? MAX_WIFI_SAVED : count + 1);
+  }
+
+  preferences.end();
+}
+
+// konek otomatis ke jaringan tersimpan
+bool tryConnectSavedWiFi() {
+  std::vector<WiFiCredential> saved = loadSavedWiFi();
+  if (saved.empty()) {
+    Serial.println("Tidak ada WiFi tersimpan di ESP32");
+    return false;
+  }
+
+  Serial.println("Mencari jaringan WiFi tersimpan");
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    Serial.println("[Tidak ada jaringan terdeteksi");
+    return false;
+  }
+
+  // cari sinyal terbaik dari daftar tersimpan
+  String bestSSID = "";
+  String bestPass = "";
+  int bestRSSI = -999;
+
+  for (int i = 0; i < n; i++) {
+    String ssidScan = WiFi.SSID(i);
+    int rssi = WiFi.RSSI(i);
+    for (auto &cred : saved) {
+      if (ssidScan == cred.ssid && rssi > bestRSSI) {
+        bestSSID = cred.ssid;
+        bestPass = cred.password;
+        bestRSSI = rssi;
+      }
+    }
+  }
+
+  if (bestSSID == "") {
+    Serial.println("Tidak ada jaringan cocok dari ESP32");
+    return false;
+  }
+
+  Serial.printf("Mencoba konek ke %s dengan (RSSI: %d)\n", bestSSID.c_str(), bestRSSI);
+  WiFi.begin(bestSSID.c_str(), bestPass.c_str());
+
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_CONNECT_TIMEOUT) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nTerhubung ke %s, IP: %s\n", bestSSID.c_str(), WiFi.localIP().toString().c_str());
+    return true;
+  } else {
+    Serial.println("\nGagal konek otomatis");
+    return false;
+  }
+}
+
+void TaskWiFiMonitor(void *parameter) {
+  for (;;) {
+    wl_status_t status = WiFi.status();
+
+    // Ketika Wifi tiba-tiba tidak terhubung
+    if (status != WL_CONNECTED) {
+
+      // Suspend semua task non-WiFi sekali saja
+      if (!tasksDisconnectSuspended) {
+        Serial.println("WiFi putus, suspend semua task non-WiFi + matikan sensor");
+
+        detachInterrupt(digitalPinToInterrupt(IR_SENSOR_PIN));
+        scale.power_down();
+
+        if (TaskInfusionMonitorHandle) vTaskSuspend(TaskInfusionMonitorHandle);
+        if (TaskDropHandle)           vTaskSuspend(TaskDropHandle);
+        if (TaskPeriodicHandle)       vTaskSuspend(TaskPeriodicHandle);
+        if (TaskFirebaseHandle)       vTaskSuspend(TaskFirebaseHandle);
+
+        tasksDisconnectSuspended = true;
+      }
+
+      // Start portal Wifi-Manager sekali
+      if (!portalRunning) {
+        portalRunning = true;
+        wm.setConfigPortalBlocking(false);
+        wm.setConfigPortalTimeout(0);
+        wm.startConfigPortal(apName, apPassword);
+        Serial.println("WiFiManager diaktifkan");
+      }
+
+      // Kalau portal masih aktif, proses event-nya
+      if (portalRunning && wm.getConfigPortalActive()) {
+        wm.process();
+      }
+
+      // Kalau WiFiManager sudah matikan portal internal (timeout / stop sendiri),
+      // sinkronkan flag lokal, tapi tidak mengganggu auto-reconnect
+      else if (portalRunning && !wm.getConfigPortalActive()) {
+        portalRunning = false;
+      }
+
+      // Cek wifi sekitar yang tersimpan
+      if (millis() - lastSavedWiFiAttempt >= SAVED_WIFI_RETRY_MS) {
+        lastSavedWiFiAttempt = millis();
+        Serial.println("Coba auto-reconnect via WiFi tersimpan");
+
+        if (tryConnectSavedWiFi()) {
+          Serial.println("Auto-reconnect via WiFi tersimpan berhasil");
+        } else {
+          Serial.println("Auto-reconnect via WiFi tersimpan gagal");
+        }
+      }
+    }
+
+    // Ketika Terhubung
+    else {
+      // Kalau portal masih dianggap running, matikan dengan aman
+      if (portalRunning) {
+        if (wm.getConfigPortalActive()) {
+          Serial.println("Matikan portal WiFiManager");
+          wm.stopConfigPortal();
+        }
+        portalRunning = false;
+      }
+
+      // Simpan kredensial dari koneksi sukses (baik dari portal ataupun manual)
+      static String lastSSID = "";
+      String currentSSID = WiFi.SSID();
+      if (currentSSID.length() > 0 && currentSSID != lastSSID) {
+        saveWiFiCredential(currentSSID, WiFi.psk());
+        lastSSID = currentSSID;
+      }
+
+      // Resume semua task sekali setelah infus terpasang
+      if (tasksDisconnectSuspended) {
+        Serial.println("Wifi tersambung kembali, resume task & sensor");
+
+        periodicResetRequest = true;
+        isReconnectPeriodic = true;
+        isReconnectDrip = true;
+
+        scale.power_up();
+        vTaskDelay(pdMS_TO_TICKS(5));
+        attachInterrupt(digitalPinToInterrupt(IR_SENSOR_PIN),
+                        detectTetesan,
+                        FALLING);
+
+        if (TaskInfusionMonitorHandle) vTaskResume(TaskInfusionMonitorHandle);
+        if (TaskPeriodicHandle)       vTaskResume(TaskPeriodicHandle);
+        if (TaskFirebaseHandle)       vTaskResume(TaskFirebaseHandle);
+        if (TaskDropHandle)           vTaskResume(TaskDropHandle);
+
+        tasksDisconnectSuspended = false;
+      }
+
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+void TaskInfusionMonitor(void *pv) {
+  for (;;) {
+    unsigned long now = millis();
+
+    int currentVolume = scale.get_units(10);
+    Serial.print("Cek status infus: ");
+    Serial.print(currentVolume);
+    Serial.println(" gram");
+
+    // Menghitung perubahan berat relatif terhadap berat stabil terakhir
+    int deltaUp = lastKnownStableWeight - currentVolume;
+    float persen = 0;
+
+    if (lastKnownStableWeight == 0) {
+      persen = 0.0;
+    } else {
+      persen = abs((float)deltaUp / (float)lastKnownStableWeight) * 100.0;
+    }
+    Serial.println("deltaUp: " + String(deltaUp) + " g | lastKnown: " + String(lastKnownStableWeight) + " g | persen: " + String(persen, 2) + " %");
+
+    // Logika deteksi infus terpasang/dilepas
+    // Jika deltaUp kurang dari -10, berarti berat saat ini lebih besar dari lastKnownStableWeight
+    // yang menandakan infus baru terpasang atau infus yang sebelumnya dilepas kini ada lagi.
+    if (deltaUp < -10) {
+      if (!infusionAttached) {
+        Serial.println("Infus terdeteksi terpasang");
+        lastTPMSend = now;
+        initialStartSent = false;
+        int currentVolume = scale.get_units(10);
+
+        lastKnownStableWeight = currentVolume;
+        periodicResetRequest = true;
+        isReconnectPeriodic = false;
+        isReconnectDrip = false;
+      }
+      infusionAttached = true;
+      lastDripMillis = millis();
+
+      if (tasksSuspended) {
+        Serial.println("Resume task & sensor");
+
+        periodicResetRequest = true;
+        isReconnectPeriodic = true;
+        isReconnectDrip = true;
+
+        attachInterrupt(digitalPinToInterrupt(IR_SENSOR_PIN),
+                        detectTetesan,
+                        FALLING);
+
+        if (TaskPeriodicHandle)       vTaskResume(TaskPeriodicHandle);
+        if (TaskDropHandle)           vTaskResume(TaskDropHandle);
+
+        tasksSuspended = false;
+      }
+    }
+
+    // Jika persentase penurunan berat mencapai atau melebihi 10%, infus dianggap sedang dilepas atau kosong.
+    else if (persen >= 10.0) {
+      if (infusionAttached) {
+        infusionAttached = false;
+
+        json.set("status", "initializing");
+        json.set("volume", 0);
+        json.set("drip_rate_tpm", 0);
+        json.set("interval", 0);
+
+        newDataUpdate = true;
+
+        if (TaskFirebaseHandle) {
+          xTaskNotifyGive(TaskFirebaseHandle);
+        }
+
+        noInterrupts();
+        tetesDalamMenit = 0;
+        lastDripMillis = 0;
+        interrupts();
+
+        initialStartSent = false;
+        lastKnownStableWeight = 0.0;
+
+        Serial.println("Data reset berhasil dikirim.");
+
+        // Suspend semua task non-WiFi
+        if (!tasksSuspended) {
+          Serial.println("Infus terdeteksi dilepas, suspend task + matikan sensor");
+
+          detachInterrupt(digitalPinToInterrupt(IR_SENSOR_PIN));
+
+          if (TaskDropHandle)           vTaskSuspend(TaskDropHandle);
+          if (TaskPeriodicHandle)       vTaskSuspend(TaskPeriodicHandle);
+
+          tasksSuspended = true;
+        }
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
+void TaskDropMonitor(void *pvParameters) {
+  for (;;) {
+    // Tunggu interrupt
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    if ((WiFi.status() != WL_CONNECTED) || !infusionAttached) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    if (isReconnectDrip) {
+      isReconnectDrip = false;
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    noInterrupts();
+    float intervalToProcess = dripInterval_ISR_float;
+    interrupts();
+
+    int currentVolume = scale.get_units(10);  
+
+    json.set("volume", currentVolume);
+    json.set("interval", intervalToProcess);
+    newDataUpdate = true; 
+
+    lastKnownStableWeight = currentVolume;
+
+    String debugJsonString;
+    json.toString(debugJsonString, true);
+    Serial.println("Mengirim data saat tetesan terdeteksi:");
+    Serial.println(debugJsonString);
+
+    if (TaskFirebaseHandle) {
+      xTaskNotifyGive(TaskFirebaseHandle);
+    }
+  }
+}
+
+void TaskFirebaseUploader(void *pvParameters) {
+  for (;;) {
+    // Bangun hanya jika ada notify dari Drop/Periodic/Reset
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    // Mnegambil dulu data flag di awal
+    bool hasDataUpdate = newDataUpdate;
+
+    // Clear global flag supaya tidak dobel
+    newDataUpdate = false;
+
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) {
+      Serial.println("Skip upload: WiFi/Firebase tidak siap");
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    // Kirim data terbaru (kalau ada)
+    if (hasDataUpdate) {
+      Serial.println("Pengiriman data dimulai");
+      if (!Firebase.RTDB.updateNode(&fbdo, firebasePatientPath, &json)) {
+        Serial.print("Pengiriman data gagal: ");
+        Serial.println(fbdo.errorReason());
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void TaskPeriodic(void *parameter) {
+  const TickType_t interval = pdMS_TO_TICKS(60000);  // 60 detik
+  TickType_t lastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    if ((WiFi.status() != WL_CONNECTED) || !infusionAttached) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    // Kalau selama nunggu, ada permintaan reset periodic (habis reconnect)
+    if (periodicResetRequest) {
+      lastWakeTime = xTaskGetTickCount();  // mulai hitung ulang
+      periodicResetRequest = false;
+      continue;
+    }
+
+    vTaskDelayUntil(&lastWakeTime, interval);
+
+    // Kalau terjadi reconnecting
+    if (isReconnectPeriodic) {
+      lastWakeTime = xTaskGetTickCount();  // mulai hitung ulang
+      isReconnectPeriodic = false;
+      continue;
+    }
+
+    if (!infusionAttached) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    // Hitung TPM dalam 60 detik terakhir
+    noInterrupts();
+    latestTPM = tetesDalamMenit;
+    tetesDalamMenit = 0;
+    interrupts();
+
+    int currentVolume = scale.get_units(10);
+
+    if (!initialStartSent) {
+      json.set("status", "start");
+      initialStartSent = true;
+    }
+
+    json.set("volume", currentVolume);
+    json.set("drip_rate_tpm", latestTPM);
+    newDataUpdate = true;
+
+    String debugJsonString;
+    json.toString(debugJsonString, true);
+    Serial.println("Mengirim data TPM dan Status:");
+    Serial.println(debugJsonString);
+
+    if (TaskFirebaseHandle) {
+      xTaskNotifyGive(TaskFirebaseHandle);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  scale.begin(DT, SCK);
+  Serial.println("Inisialisasi Load Cell");
+  while (!scale.is_ready()) {
+    delay(500);
+  }
+  Serial.println("Load Cell siap!");
+
+  scale.set_scale(calibration_factor);
+  Serial.println("Melakukan tare, pastikan tidak ada beban di atas load cell");
+  delay(3000);
+  scale.tare();
+  Serial.println("Tare selesai. Mulai pembacaan berat");
+
+  pinMode(IR_SENSOR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(IR_SENSOR_PIN), detectTetesan, FALLING);
+  Serial.println("Sensor IR Siap.");
+
+  if (!tryConnectSavedWiFi()) {
+    if (wm.autoConnect(apName, apPassword)) {
+      Serial.println("WiFi pertama kali tersambung!");
+      saveWiFiCredential(WiFi.SSID(), WiFi.psk());
+    } else {
+      Serial.println("Gagal konek WiFi. Coba lagi nanti.");
+    }
+  }
+
+  delay(1000);
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  Firebase.signUp(&config, &auth, "", "");
+  Firebase.begin(&config, &auth);
+
+  Firebase.reconnectWiFi(true);
+  while (!Firebase.ready()) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  sendInitialDataToFirebase(0);
+
+  xTaskCreatePinnedToCore(
+    TaskWiFiMonitor,         
+    "TaskWiFiMonitor",       
+    6144,                   
+    NULL,                   
+    1,                       
+    &TaskWiFiMonitorHandle, 
+    0                       
+  );
+
+  xTaskCreatePinnedToCore(
+    TaskInfusionMonitor,
+    "InfusionMonitor",
+    4096,
+    NULL,
+    2,
+    &TaskInfusionMonitorHandle,
+    1
+  );
+
+  xTaskCreatePinnedToCore(
+    TaskFirebaseUploader,
+    "TaskFirebaseUploader",
+    6144,
+    NULL,
+    1,
+    &TaskFirebaseHandle,
+    1
+  );
+
+  xTaskCreatePinnedToCore(
+    TaskPeriodic, 
+    "TaskPeriodic", 
+    4096, 
+    NULL, 
+    1, 
+    &TaskPeriodicHandle, 
+    1
+  );
+
+  xTaskCreatePinnedToCore(
+    TaskDropMonitor,
+    "TaskDropMonitor",
+    4096,
+    NULL,
+    1,
+    &TaskDropHandle,
+    1);
+
+  Serial.println("Semua task aktif. Sistem monitoring dimulai");
+}
+
+void loop() {
+
+}
